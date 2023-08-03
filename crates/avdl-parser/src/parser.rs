@@ -4,8 +4,10 @@ use std::fs;
 use thiserror::Error;
 
 use crate::string_parser::parse_string as parse_string_uni;
-use apache_avro::schema::{Alias, Name, Namespace, RecordFieldOrder};
-use apache_avro::schema::{RecordField, Schema, UnionSchema};
+use apache_avro::schema::{
+    Alias, EnumSchema, FixedSchema, Name, Namespace, RecordFieldOrder, RecordSchema,
+};
+use apache_avro::schema::{DecimalSchema, RecordField, Schema, UnionSchema};
 use apache_avro::types::Value as AvroValue;
 use nom::bytes::complete::take_till;
 use nom::character::complete::space0;
@@ -397,11 +399,11 @@ fn map_type_to_schema(input: &str) -> IResult<&str, Schema> {
             ),
             |(precision, scale)| {
                 // TODO: Review If inner should be float or calculated differently
-                Schema::Decimal {
+                Schema::Decimal(DecimalSchema {
                     precision: precision,
                     scale: scale,
                     inner: Box::new(Schema::Bytes),
-                }
+                })
             },
         ),
         map_res(
@@ -452,11 +454,11 @@ fn parse_based_on_schema<'r>(
         Schema::TimeMillis => Box::new(map_int),
         Schema::TimestampMillis => Box::new(map_long),
         Schema::Uuid => Box::new(map_uuid),
-        Schema::Decimal {
+        Schema::Decimal(DecimalSchema {
             precision: _,
             scale: _,
             inner: _,
-        } => Box::new(map_decimal),
+        }) => Box::new(map_decimal),
         Schema::TimestampMicros => Box::new(map_long),
         Schema::TimeMicros => Box::new(map_long),
         Schema::Duration => todo!("This should be fixed"),
@@ -753,20 +755,16 @@ fn parse_enum(input: &str) -> IResult<&str, Schema> {
     ))(input)?;
     let n = Name::new(name).unwrap();
 
-    // TODO: Check if we need to validate enum's default against one of the options
-    if default.is_some() {
-        println!("Warning: default is being ignored as of now.")
-    }
-
     Ok((
         tail,
-        Schema::Enum {
+        Schema::Enum(EnumSchema {
             name: n,
             aliases: aliases,
             doc: doc,
             symbols: body.into_iter().map(String::from).collect::<Vec<String>>(),
             attributes: BTreeMap::new(),
-        },
+            default: default,
+        }),
     ))
 }
 
@@ -793,13 +791,13 @@ fn parse_fixed(input: &str) -> IResult<&str, Schema> {
 
     Ok((
         tail,
-        Schema::Fixed {
+        Schema::Fixed(FixedSchema {
             name: name.into(),
             aliases: aliases.clone(),
             doc: doc,
             size: size,
             attributes: BTreeMap::new(),
-        },
+        }),
     ))
 }
 
@@ -918,14 +916,14 @@ pub fn parse_record(input: &str) -> IResult<&str, Schema> {
 
     Ok((
         tail,
-        Schema::Record {
+        Schema::Record(RecordSchema {
             name: name,
             aliases: aliases,
             doc: doc,
             fields: fields,
             lookup: BTreeMap::new(),
             attributes: BTreeMap::new(),
-        },
+        }),
     ))
 }
 
@@ -1020,14 +1018,14 @@ pub fn parse_protocol<'a>(
             many1(space_or_comment_delimited(map_res(
                 alt((parse_record, parse_enum, parse_fixed)),
                 |mut schema| match &mut schema {
-                    Schema::Record {
+                    Schema::Record(RecordSchema {
                         name,
                         aliases: _,
                         doc: _,
                         fields: _,
                         lookup: _,
                         attributes: _,
-                    } => {
+                    }) => {
                         // name.namespace = Some("cagon.org".to_string());
                         let name = name.clone();
                         if names_ref.contains_key(&name) {
@@ -1036,13 +1034,13 @@ pub fn parse_protocol<'a>(
                         names_ref.insert(name, schema.clone());
                         return Ok(schema);
                     }
-                    Schema::Fixed {
+                    Schema::Fixed(FixedSchema {
                         name,
                         aliases: _,
                         doc: _,
                         size: _,
                         attributes: _,
-                    } => {
+                    }) => {
                         let name = name.clone();
                         if names_ref.contains_key(&name) {
                             return Err("Duplicate field {name}");
@@ -1050,13 +1048,14 @@ pub fn parse_protocol<'a>(
                         names_ref.insert(name, schema.clone());
                         return Ok(schema);
                     }
-                    Schema::Enum {
+                    Schema::Enum(EnumSchema {
                         name,
                         aliases: _,
                         doc: _,
                         symbols: _,
                         attributes: _,
-                    } => {
+                        default: _,
+                    }) => {
                         let name = name.clone();
                         if names_ref.contains_key(&name) {
                             return Err("Duplicate field {name}");
@@ -1104,7 +1103,7 @@ fn schema_solver(
     enclosing_namespace: &Namespace,
 ) -> Result<Operation, String> {
     match schema {
-        Schema::Record { name, fields, .. } => {
+        Schema::Record(RecordSchema { name, fields, .. }) => {
             let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
 
             let record_namespace = fully_qualified_name.namespace;
@@ -1132,10 +1131,10 @@ fn schema_solver(
 
 fn namespace_solver(schema: &mut Schema, enclosing_namespace: &Namespace) -> () {
     match schema {
-        Schema::Record { name, .. } => {
+        Schema::Record(RecordSchema { name, .. }) => {
             name.namespace = enclosing_namespace.clone();
-        },
-        _ => ()
+        }
+        _ => (),
     }
 }
 
@@ -1365,7 +1364,7 @@ mod test {
     }
 
     #[rstest]
-    #[case("decimal(1,2) age = \"1.2\";", (Schema::Decimal { precision: 1, scale: 2, inner: Box::new(Schema::Bytes) }, None, None, None, "age", Some(AvroValue::Decimal("1.2".into()).try_into().unwrap())))]
+    #[case("decimal(1,2) age = \"1.2\";", (Schema::Decimal(DecimalSchema { precision: 1, scale: 2, inner: Box::new(Schema::Bytes) }), None, None, None, "age", Some(AvroValue::Decimal("1.2".into()).try_into().unwrap())))]
     #[case("int age;", (Schema::Int, None, None, None, "age", None))]
     #[case("/** How old is */ int age;", (Schema::Int, Some(String::from("How old is")), None, None, "age", None))]
     #[case("int age = 12;", (Schema::Int, None, None, None, "age", Some(Value::Number(12.into()))))]
@@ -1570,9 +1569,9 @@ mod test {
     }
 
     #[rstest]
-    #[case(r#"fixed MD5(16);"#, Schema::Fixed { name: "MD5".into(), aliases: None, doc: None, size: 16, attributes: BTreeMap::new()})]
-    #[case("/** my hash */ \nfixed MD5(16);", Schema::Fixed { name: "MD5".into(), aliases: None, doc: Some("my hash".to_string()), size: 16, attributes: BTreeMap::new()})]
-    #[case(r#"fixed @aliases(["md1"]) MD5(16);"#, Schema::Fixed { name: "MD5".into(), aliases: None, doc: None, size: 16, attributes: BTreeMap::new()})]
+    #[case(r#"fixed MD5(16);"#, Schema::Fixed(FixedSchema { name: "MD5".into(), aliases: None, doc: None, size: 16, attributes: BTreeMap::new()}))]
+    #[case("/** my hash */ \nfixed MD5(16);", Schema::Fixed(FixedSchema { name: "MD5".into(), aliases: None, doc: Some("my hash".to_string()), size: 16, attributes: BTreeMap::new()}))]
+    #[case(r#"fixed @aliases(["md1"]) MD5(16);"#, Schema::Fixed(FixedSchema { name: "MD5".into(), aliases: None, doc: None, size: 16, attributes: BTreeMap::new()}))]
     fn test_parse_fixed_ok(#[case] input: &str, #[case] expected: Schema) {
         assert_eq!(parse_fixed(input), Ok(("", expected)));
     }
@@ -1610,7 +1609,7 @@ mod test {
             SQUARE, TRIANGLE, CIRCLE, OVAL
         }";
         let o = parse_enum(input);
-        let expected = Schema::Enum {
+        let expected = Schema::Enum(EnumSchema {
             name: Name::new("Shapes").unwrap(),
             aliases: None,
             doc: None,
@@ -1621,7 +1620,8 @@ mod test {
                 String::from("OVAL"),
             ],
             attributes: BTreeMap::new(),
-        };
+            default: None,
+        });
         assert_eq!(o, Ok(("", expected)));
     }
 
@@ -1632,7 +1632,7 @@ mod test {
             SQUARE, TRIANGLE, CIRCLE, OVAL
         }"#;
         let o = parse_enum(input);
-        let expected = Schema::Enum {
+        let expected = Schema::Enum(EnumSchema {
             name: Name::new("Shapes").unwrap(),
             aliases: Some(vec![
                 Alias::new("org.old.OldRecord").unwrap(),
@@ -1646,7 +1646,8 @@ mod test {
                 String::from("OVAL"),
             ],
             attributes: BTreeMap::new(),
-        };
+            default: None,
+        });
         assert_eq!(o, Ok(("", expected)));
     }
 
@@ -1657,7 +1658,7 @@ mod test {
             SQUARE, TRIANGLE, CIRCLE, OVAL
         } = SQUARE;"#;
         let o = parse_enum(input);
-        let expected = Schema::Enum {
+        let expected = Schema::Enum(EnumSchema {
             name: Name::new("Shapes").unwrap(),
             aliases: Some(vec![
                 Alias::new("org.old.OldRecord").unwrap(),
@@ -1671,7 +1672,8 @@ mod test {
                 String::from("OVAL"),
             ],
             attributes: BTreeMap::new(),
-        };
+            default: None,
+        });
         assert_eq!(o, Ok(("", expected)));
     }
 
@@ -1734,7 +1736,7 @@ mod test {
             string name;
         }"#;
         let (_tail, schema) = parse_record(sample).unwrap();
-        let expected = Schema::Record {
+        let expected = Schema::Record(RecordSchema {
             name: Name {
                 name: "Employee".into(),
                 namespace: None,
@@ -1756,7 +1758,7 @@ mod test {
             }],
             lookup: BTreeMap::new(),
             attributes: BTreeMap::new(),
-        };
+        });
         println!("{schema:#?}");
         assert_eq!(schema, expected);
     }
@@ -1780,7 +1782,7 @@ mod test {
     fn test_parse_record_alias_and_namespace(#[case] input: &str) {
         let (_tail, schema) = parse_record(input).unwrap();
 
-        let expected = Schema::Record {
+        let expected = Schema::Record(RecordSchema {
             name: Name {
                 name: "Employee".into(),
                 namespace: Some("org.apache.avro.someOtherNamespace".into()),
@@ -1802,7 +1804,7 @@ mod test {
             }],
             lookup: BTreeMap::new(),
             attributes: BTreeMap::new(),
-        };
+        });
         assert_eq!(schema, expected);
     }
 
@@ -1851,7 +1853,7 @@ mod test {
         let (_tail, schemas) = parse(input).unwrap();
 
         let expected = vec![
-            Schema::Record {
+            Schema::Record(RecordSchema {
                 name: Name {
                     name: "Hello".into(),
                     namespace: None,
@@ -1870,8 +1872,8 @@ mod test {
                 }],
                 lookup: BTreeMap::new(),
                 attributes: BTreeMap::new(),
-            },
-            Schema::Record {
+            }),
+            Schema::Record(RecordSchema {
                 name: Name {
                     name: "Parent".into(),
                     namespace: None,
@@ -1883,7 +1885,7 @@ mod test {
                     doc: None,
                     aliases: None,
                     default: None,
-                    schema: Schema::Record {
+                    schema: Schema::Record(RecordSchema {
                         name: Name {
                             name: "Hello".into(),
                             namespace: None,
@@ -1902,14 +1904,14 @@ mod test {
                         }],
                         lookup: BTreeMap::new(),
                         attributes: BTreeMap::new(),
-                    },
+                    }),
                     order: RecordFieldOrder::Ascending,
                     position: 0,
                     custom_attributes: BTreeMap::new(),
                 }],
                 lookup: BTreeMap::new(),
                 attributes: BTreeMap::new(),
-            },
+            }),
         ];
 
         assert_eq!(expected, schemas)
@@ -1928,7 +1930,7 @@ mod test {
         let (_tail, schema) = parse_record(input_schema).unwrap();
         let out = serde_json::to_string_pretty(&schema).unwrap();
         println!("{out}");
-        let expected = Schema::Record {
+        let expected = Schema::Record(RecordSchema {
             name: Name {
                 name: "Employee".into(),
                 namespace: Some("org.apache.avro.someOtherNamespace".into()),
@@ -1972,7 +1974,7 @@ mod test {
             ],
             lookup: BTreeMap::new(),
             attributes: BTreeMap::new(),
-        };
+        });
         assert_eq!(schema, expected);
     }
 }
